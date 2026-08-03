@@ -13,7 +13,7 @@ import {
   buildLocalUpdateSource,
   shouldUseFullDepthForUpdate,
 } from './update-source.ts';
-import { cloneRepo, cleanupTempDir } from './git.ts';
+import { cloneRepo, cleanupTempDir, getGitTreeHash } from './git.ts';
 import { discoverSkills } from './skills.ts';
 import { fetchRepoTree, getSkillFolderHashFromTree } from './blob.ts';
 import { wellKnownProvider, computeWellKnownSkillDigest } from './providers/index.ts';
@@ -543,40 +543,39 @@ export async function updateGlobalSkills(
       if (isGitHubSource) {
         const tree = await fetchRepoTree(source, firstEntry.ref, getGitHubToken);
 
-        if (!tree) {
-          console.log(`  ${DIM}✗ Failed to fetch tree for ${source}${RESET}`);
+        if (tree) {
+          const discoveredPaths = tree.tree
+            .filter((entry) => entry.type === 'blob')
+            .map((entry) => entry.path);
+
+          const allLockedForSource = Object.entries(lock.skills)
+            .filter(([_, entry]) => entry.source === source)
+            .map(([name, _]) => name);
+
+          const deletedSkills = await checkAndPromptForDeletions(
+            source,
+            allLockedForSource,
+            lock.skills,
+            true,
+            options,
+            discoveredPaths
+          );
+
+          const deletedSkillSet = new Set(deletedSkills);
+
+          for (const { name: skillName, entry } of itemsForSource) {
+            if (deletedSkillSet.has(skillName)) continue;
+
+            const latestHash = getSkillFolderHashFromTree(tree, entry.skillPath!);
+            if (latestHash && latestHash !== entry.skillFolderHash) {
+              updates.push({ name: skillName, source, entry });
+            }
+          }
+
           continue;
         }
 
-        const discoveredPaths = tree.tree
-          .filter((entry) => entry.type === 'blob')
-          .map((entry) => entry.path);
-
-        const allLockedForSource = Object.entries(lock.skills)
-          .filter(([_, entry]) => entry.source === source)
-          .map(([name, _]) => name);
-
-        const deletedSkills = await checkAndPromptForDeletions(
-          source,
-          allLockedForSource,
-          lock.skills,
-          true,
-          options,
-          discoveredPaths
-        );
-
-        const deletedSkillSet = new Set(deletedSkills);
-
-        for (const { name: skillName, entry } of itemsForSource) {
-          if (deletedSkillSet.has(skillName)) continue;
-
-          const latestHash = getSkillFolderHashFromTree(tree, entry.skillPath!);
-          if (latestHash && latestHash !== entry.skillFolderHash) {
-            updates.push({ name: skillName, source, entry });
-          }
-        }
-
-        continue;
+        console.log(`  ${DIM}GitHub API unavailable; checking via Git clone${RESET}`);
       }
 
       tempDir = await cloneRepo(sourceUrl, firstEntry.ref);
@@ -607,7 +606,10 @@ export async function updateGlobalSkills(
         const skillPath = entry.skillPath!;
         if (!discoveredPaths.includes(skillPath)) continue;
 
-        const latestHash = await computeSkillFolderHash(join(tempDir, dirname(skillPath)));
+        const usesGitTreeHash = isGitHubSource && /^[0-9a-f]{40}$/i.test(entry.skillFolderHash);
+        const latestHash = usesGitTreeHash
+          ? await getGitTreeHash(tempDir, skillPath)
+          : await computeSkillFolderHash(join(tempDir, dirname(skillPath)));
         if (latestHash && latestHash !== entry.skillFolderHash) {
           updates.push({ name: skillName, source, entry });
         }
